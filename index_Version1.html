@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Shadow Runner ― 影だけで世界を読むアクションパズル</title>
+<style>
+  html,body { height:100%; margin:0; background:#e9e9e9; font-family:system-ui,-apple-system,Segoe UI,Roboto,'Hiragino Kaku Gothic ProN',Meiryo,sans-serif; }
+  #game { display:block; margin:0 auto; background:linear-gradient(#ddd,#ccc); box-shadow:0 6px 20px rgba(0,0,0,0.2); }
+  #ui {
+    position:fixed; left:12px; top:12px; color:#fff; font-weight:600; text-shadow:0 1px 0 rgba(0,0,0,0.6);
+  }
+  #stageInfo { position:fixed; right:12px; top:12px; color:#fff; font-weight:600; text-shadow:0 1px 0 rgba(0,0,0,0.6); }
+  #controls {
+    position:fixed; left:0; right:0; bottom:12px; text-align:center; color:#fff;
+    font-weight:600; text-shadow:0 1px 0 rgba(0,0,0,0.6);
+  }
+  .hint {
+    position:fixed; left:12px; bottom:12px; color:#fff; opacity:0.9; font-size:13px;
+    text-shadow:0 1px 0 rgba(0,0,0,0.6);
+  }
+  #fps { position:fixed; right:12px; bottom:12px; color:#fff; font-size:12px; text-shadow:0 1px 0 rgba(0,0,0,0.6);}
+  button { margin-left:8px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<div id="ui">光源方向: <span id="lightArrow">→</span></div>
+<div id="stageInfo">Stage <span id="stageNum">1</span></div>
+<div id="controls">操作: ← → 移動 / スペース ジャンプ &nbsp; <button id="restart">リトライ</button> <button id="next">次のステージ</button></div>
+<div class="hint" id="message">影だけを見て本当の地形を推理しよう</div>
+<div id="fps"></div>
+
+<script>
+// --- 設定 ---
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const groundY = H - 80; // 目安の地面ライン（影のプロジェクション参照）
+const gravity = 1200; // px/s^2
+const playerW = 28, playerH = 48;
+const shadowScale = 1.0; // 影の伸び具合のスケール
+
+// UI参照
+const stageNumEl = document.getElementById('stageNum');
+const lightArrowEl = document.getElementById('lightArrow');
+const messageEl = document.getElementById('message');
+const fpsEl = document.getElementById('fps');
+
+let lastT = performance.now();
+let dtAcc = 0;
+
+// --- 入力 ---
+const keys = { left:false, right:false, jump:false, space:false };
+window.addEventListener('keydown', e => {
+  if (e.code === 'ArrowLeft' || e.key === 'ArrowLeft') keys.left = true;
+  if (e.code === 'ArrowRight' || e.key === 'ArrowRight') keys.right = true;
+  if (e.code === 'Space') { keys.jump = true; keys.space = true; e.preventDefault(); }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'ArrowLeft' || e.key === 'ArrowLeft') keys.left = false;
+  if (e.code === 'ArrowRight' || e.key === 'ArrowRight') keys.right = false;
+  if (e.code === 'Space') { keys.jump = false; keys.space = false; }
+});
+
+// --- ユーティリティ ---
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function vec(x,y){ return {x,y}; }
+function norm(v){
+  const m = Math.hypot(v.x, v.y) || 1; return {x:v.x/m, y:v.y/m};
+}
+function perp(v){ return {x:-v.y, y:v.x}; }
+
+// --- レベル定義（実際の「当たり判定」を持つ世界） ---
+const levels = [
+  // Stage 1: 固定光源（チュートリアル）
+  {
+    name: '静止した光源',
+    light: { type:'fixed', angle: -20 * Math.PI/180 }, // ライト方向（光が左上から照らすのか右上からか）：影は逆方向に伸びる
+    platforms: [
+      { x: 100, y: groundY-0, w: 760, h: 20 }, // 地面
+      { x: 220, y: groundY-120, w: 120, h: 18 },
+      { x: 420, y: groundY-200, w: 140, h: 18 },
+      { x: 620, y: groundY-160, w: 100, h: 18 },
+    ],
+    enemies: []
+  },
+  // Stage 2: ゆっくり動く光源
+  {
+    name: '動く光源（ゆっくり）',
+    light: { type:'swing', baseAngle:-20*Math.PI/180, amp:30*Math.PI/180, speed:0.7 },
+    platforms: [
+      { x: 40, y: groundY-0, w: 880, h: 20 },
+      { x: 140, y: groundY-90, w: 90, h: 18 },
+      { x: 320, y: groundY-140, w: 120, h: 18 },
+      { x: 520, y: groundY-200, w: 140, h: 18 },
+      { x: 740, y: groundY-110, w: 120, h: 18 },
+    ],
+    enemies: []
+  },
+  // Stage 3: 敵の影
+  {
+    name: '敵の影（影と本体のズレ）',
+    light: { type:'swing', baseAngle:-15*Math.PI/180, amp:25*Math.PI/180, speed:0.9 },
+    platforms: [
+      { x: 0, y: groundY, w: 960, h: 20 },
+      { x: 200, y: groundY-120, w: 120, h: 18 },
+      { x: 420, y: groundY-160, w: 120, h: 18 },
+      { x: 600, y: groundY-200, w: 160, h: 18 },
+    ],
+    enemies: [
+      // 敵: 実体は invisible、影は独自のズレを持つ（プレイヤーは実体に当たる）
+      { x: 260, y: groundY-150, w:30, h:48, patrol:[260,360], speed:40, phase:0, shadowBiasAmp:24, shadowBiasFreq:2.2 },
+      { x: 520, y: groundY-230, w:30, h:48, patrol:[520,700], speed:60, phase:1.5, shadowBiasAmp:36, shadowBiasFreq:1.6 },
+    ]
+  },
+  // Stage 4: 複数光源（影が二重）
+  {
+    name: '複数光源',
+    light: {
+      type:'dual',
+      lights:[
+        { type:'fixed', angle:-12*Math.PI/180, intensity:0.7 },
+        { type:'fixed', angle:18*Math.PI/180, intensity:0.6 }
+      ]
+    },
+    platforms: [
+      { x: 0, y: groundY, w: 960, h: 20 },
+      { x: 160, y: groundY-100, w: 120, h: 18 },
+      { x: 360, y: groundY-180, w: 160, h: 18 },
+      { x: 620, y: groundY-140, w: 120, h: 18 },
+    ],
+    enemies: [
+      { x: 420, y: groundY-220, w:30, h:48, patrol:[420,560], speed:50, phase:0.7, shadowBiasAmp:18, shadowBiasFreq:2.0 }
+    ]
+  }
+];
+
+// --- ゲーム状態 ---
+let curLevel = 0;
+let world = null;
+let player = null;
+let running = true;
+let accumulatedTime = 0;
+let fpsCounter = { last: performance.now(), frames:0 };
+
+// --- 初期化 ---
+function startLevel(idx){
+  curLevel = idx % levels.length;
+  const lvl = levels[curLevel];
+  stageNumEl.textContent = (curLevel+1).toString();
+  messageEl.textContent = lvl.name;
+  // 世界データコピー
+  world = {
+    platforms: lvl.platforms.map(p => ({...p})),
+    enemies: lvl.enemies.map(e => ({...e, vx: e.speed, dir:1, t:0}))
+  };
+  // プレイヤー初期配置（見えない本体）
+  player = {
+    x: 80, y: groundY - 60, w: playerW, h: playerH,
+    vx:0, vy:0, onGround:false
+  };
+}
+document.getElementById('restart').addEventListener('click', ()=> startLevel(curLevel));
+document.getElementById('next').addEventListener('click', ()=> startLevel((curLevel+1)%levels.length));
+
+startLevel(0);
+
+// --- ライト計算ユーティリティ ---
+function getLightState(t){
+  const cfg = levels[curLevel].light;
+  if(cfg.type === 'fixed') {
+    return { single: true, vector: norm({x: Math.cos(cfg.angle), y: Math.sin(cfg.angle)}), angles:[cfg.angle] };
+  } else if(cfg.type === 'swing') {
+    const ang = cfg.baseAngle + Math.sin(t*cfg.speed) * cfg.amp;
+    lightArrowEl.textContent = angleToArrow(ang);
+    return { single: true, vector: norm({x:Math.cos(ang), y:Math.sin(ang)}), angles:[ang] };
+  } else if(cfg.type === 'dual') {
+    // 固定の2灯光源
+    const lights = cfg.lights.map(L => ({vector:norm({x:Math.cos(L.angle), y:Math.sin(L.angle)}), intensity:L.intensity, angle:L.angle}));
+    // arrow show composite average
+    const avgx = lights.reduce((s,l)=>s + l.vector.x*l.intensity,0)/lights.reduce((s,l)=>s+l.intensity,0);
+    const avgy = lights.reduce((s,l)=>s + l.vector.y*l.intensity,0)/lights.reduce((s,l)=>s+l.intensity,0);
+    lightArrowEl.textContent = angleToArrow(Math.atan2(avgy, avgx));
+    return { single:false, lights };
+  }
+  return { single:true, vector: norm({x:1,y:-0.3}), angles:[0] };
+}
+function angleToArrow(a){
+  // 四方向近似（上/右/下/左 + 中間）
+  const deg = a*180/Math.PI;
+  if(deg < -135 || deg > 135) return '←';
+  if(deg < -45) return '↖';
+  if(deg < 45) return '↑';
+  if(deg < 135) return '→';
+  return '↘';
+}
+
+// --- 影の投影: オブジェクト（矩形）の角をライト方向にオフセットして影ポリゴン作る ---
+function projectShadowRect(obj, lightVec, extraBias=0){
+  // オブジェクトの上辺（キャラクター等）の高さから地面（groundY）までの差を使って伸ばす
+  // 高さ差が大きいほど影が長くなる
+  const topY = obj.y;
+  const heightAboveGround = Math.max(0, groundY - topY);
+  // 影の長さスケーリング
+  const len = heightAboveGround * (0.7 + shadowScale*0.6);
+  const ox = lightVec.x * len + extraBias.x;
+  const oy = lightVec.y * len + extraBias.y;
+  const corners = [
+    {x: obj.x,     y: obj.y},
+    {x: obj.x + obj.w, y: obj.y},
+    {x: obj.x + obj.w, y: obj.y + obj.h},
+    {x: obj.x,     y: obj.y + obj.h},
+  ];
+  return corners.map(c => ({x:c.x + ox, y:c.y + oy}));
+}
+
+// --- 描画: 影のみを描く ---
+function drawShadowPolygon(poly, alpha=1.0, color='rgba(0,0,0,1)'){
+  ctx.beginPath();
+  ctx.moveTo(poly[0].x, poly[0].y);
+  for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x, poly[i].y);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.globalAlpha = alpha;
+  ctx.fill();
+  ctx.globalAlpha = 1.0;
+}
+
+// プレイヤーの影（楕円）を描く
+function drawPlayerShadow(player, lightVec, extraBias={x:0,y:0}, alpha=1.0){
+  const topY = player.y;
+  const heightAboveGround = Math.max(0, groundY - topY);
+  const len = heightAboveGround * (0.9 + shadowScale*0.6);
+  const cx = (player.x + player.w/2) + lightVec.x * len + extraBias.x;
+  const cy = (player.y + player.h) + lightVec.y * len + extraBias.y + 6;
+  const rx = player.w * (1.1 + Math.min(1.2, heightAboveGround/120));
+  const ry = player.h * 0.4 * (1 + Math.min(1.2, heightAboveGround/160));
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI*2);
+  ctx.fillStyle = 'black';
+  ctx.globalAlpha = alpha;
+  ctx.fill();
+  // 輪郭（見やすさ向上）
+  ctx.globalAlpha = 1.0;
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+// --- 衝突 / 物理（実体は可視化しない） ---
+function physicsStep(dt){
+  // horizontal input
+  const speed = 220;
+  if(keys.left) player.vx = -speed;
+  else if(keys.right) player.vx = speed;
+  else player.vx = 0;
+
+  // jump
+  if(keys.space && player.onGround){
+    player.vy = -520;
+    player.onGround = false;
+    keys.space = false; // 押しっぱなし防止
+  }
+
+  // gravity
+  player.vy += gravity * dt;
+  player.x += player.vx * dt;
+  player.y += player.vy * dt;
+
+  // 簡易ワールド衝突 (platforms: treat top surface)
+  player.onGround = false;
+  for(const p of world.platforms){
+    // AABB horizontal overlap
+    if(player.x + player.w > p.x && player.x < p.x + p.w){
+      // landing on top
+      const playerBottomPrev = player.y - player.vy*dt + player.h;
+      const playerBottom = player.y + player.h;
+      const platformTop = p.y;
+      if(playerBottomPrev <= platformTop && playerBottom >= platformTop){
+        // land
+        player.y = platformTop - player.h;
+        player.vy = 0;
+        player.onGround = true;
+      }
+    }
+    // simple horizontal bounds
+    if(player.x < 0) player.x = 0;
+    if(player.x + player.w > W) player.x = W - player.w;
+  }
+
+  // 敵移動
+  for(const e of world.enemies){
+    e.t += dt;
+    // パトロール
+    const [a,b] = e.patrol;
+    if(e.dir > 0) e.x += e.speed * dt;
+    else e.x -= e.speed * dt;
+    if(e.x < Math.min(a,b)) { e.x = Math.min(a,b); e.dir = 1; }
+    if(e.x > Math.max(a,b)) { e.x = Math.max(a,b); e.dir = -1; }
+    // 敵の当たり判定: プレイヤーと当たればリトライ
+    if(rectRectCollision(player, e)){
+      // リトライ
+      startLevel(curLevel);
+    }
+  }
+
+  // 落下チェック: 画面外に落ちたらリトライ
+  if(player.y > H + 200) startLevel(curLevel);
+}
+
+function rectRectCollision(a,b){
+  return (a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y);
+}
+
+// --- メイン描画ループ ---
+function render(t){
+  const now = t;
+  let dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  dtAcc += dt;
+
+  // FPS
+  fpsCounter.frames++;
+  if(now - fpsCounter.last > 500){
+    const fps = Math.round((fpsCounter.frames*1000)/(now - fpsCounter.last));
+    fpsEl.textContent = fps + ' FPS';
+    fpsCounter.last = now;
+    fpsCounter.frames = 0;
+  }
+
+  // 物理更新（固定更新風）
+  let steps = 0;
+  while(dtAcc > 1/120 && steps < 5){
+    physicsStep(1/120);
+    dtAcc -= 1/120;
+    steps++;
+  }
+  // 画面描画
+  ctx.clearRect(0,0,W,H);
+  // 背景（薄いグレー）と軽いグラデーションがcanvasの背景CSSで設定されているためここは空白でもOK
+
+  // 描画前にライト情報取得
+  const lightState = getLightState(now/1000);
+
+  // 1) 影の描画（プラットフォーム、敵、プレイヤー）
+  // 描画順: 遠いもの→近いものでオーバーラップが自然に見えるように簡易ソート (y座標)
+  const drawOrder = [...world.platforms.map(p=>({type:'plat',obj:p})), ...world.enemies.map(e=>({type:'enemy',obj:e})), {type:'player', obj:player}];
+  drawOrder.sort((a,b)=> (a.obj.y + (a.obj.h||0)) - (b.obj.y + (b.obj.h||0)));
+
+  // 影の色設定（単色の世界：黒の濃淡）
+  for(const item of drawOrder){
+    if(item.type === 'plat'){
+      const p = item.obj;
+      if(!lightState.single){
+        // dual lights: draw two shadows with different opacity & offset
+        for(const L of lightState.lights){
+          const poly = projectShadowRect(p, L.vector, {x:0,y:0});
+          drawShadowPolygon(poly, 0.22 * L.intensity, 'black');
+        }
+      } else {
+        const poly = projectShadowRect(p, lightState.vector, {x:0,y:0});
+        drawShadowPolygon(poly, 0.6, 'black');
+      }
+    } else if(item.type === 'enemy'){
+      const e = item.obj;
+      // 敵の影は本体位置とは微妙にズレる（time-based bias + perp）
+      const biasVal = Math.sin(e.t * e.shadowBiasFreq + e.phase) * e.shadowBiasAmp;
+      if(!lightState.single){
+        for(const L of lightState.lights){
+          const perpV = perp(L.vector);
+          const extra = {x: perpV.x * biasVal, y: perpV.y * biasVal};
+          const poly = projectShadowRect(e, L.vector, extra);
+          drawShadowPolygon(poly, 0.5 * 0.9 * L.intensity, 'black');
+        }
+      } else {
+        const perpV = perp(lightState.vector);
+        const extra = {x: perpV.x * biasVal, y: perpV.y * biasVal};
+        const poly = projectShadowRect(e, lightState.vector, extra);
+        drawShadowPolygon(poly, 0.85, 'black');
+      }
+    } else if(item.type === 'player'){
+      const pl = item.obj;
+      if(!lightState.single){
+        // 複数光源: 複数のやや薄い影が重なる
+        for(const L of lightState.lights){
+          const bias = {x:0,y:0};
+          drawPlayerShadow(pl, L.vector, bias, 0.55*L.intensity);
+        }
+      } else {
+        drawPlayerShadow(pl, lightState.vector, {x:0,y:0}, 1.0);
+      }
+    }
+  }
+
+  // 2) UI 補助（光源矢印・ステージ番号等はDOM側で表示）
+  // 軽いデバッグライン（地面参考）
+  ctx.strokeStyle = 'rgba(0,0,0,0.06)';
+  ctx.beginPath();
+  ctx.moveTo(0, groundY + 0.5);
+  ctx.lineTo(W, groundY + 0.5);
+  ctx.stroke();
+
+  // 3) 影の説明やチュートリアルヒント
+  // 画面下中央に簡単な操作説明は既にDOMで表示
+
+  // 次フレーム
+  requestAnimationFrame(render);
+}
+
+// 開始
+requestAnimationFrame(render);
+
+</script>
+</body>
+</html>
